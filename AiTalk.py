@@ -1,104 +1,178 @@
-import tkinter as tk
-from tkinter import simpledialog, messagebox
+import sys
+import os
 import json
 import requests
-import os
 import threading
+import base64
+import re
 from datetime import datetime
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
+    QLineEdit, QPushButton, QListWidget, QFileDialog, QMessageBox
+)
+from PySide6.QtGui import QTextCursor, QTextCharFormat, QFont, QColor
+from PySide6.QtCore import Qt
 
-SESSION_DIR = "D:\\joy\\HistoryAi"
+SESSION_DIR = "D:/joy/HistoryAi"
 os.makedirs(SESSION_DIR, exist_ok=True)
 
-class ChatApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AI 对话程序")
+SUPPORTED_MODELS = {
+    "gpt-4o": ["text", "image"],
+    "gpt-4-vision-preview": ["text", "image"],
+    "o4-mini": ["text", "image"],
+    "gpt-4.1-mini": ["text"],
+    "gpt-3.5-turbo": ["text"]
+}
 
+def extract_clean_content(content):
+    if isinstance(content, list):
+        return "[图片]"
+    if not isinstance(content, str):
+        return None
+
+    match = re.search(r"## ?[\u4e00-\u9fa5]*回答[:：]?\n*(.+)", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    if any(tag in content.lower() for tag in ["<think>", "<error>", "</think>", "<unk>", "<|", "</"]):
+        return None
+
+    return content.strip()
+
+class ChatWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI 聊天程序（半成品）")
+        self.resize(900, 600)
         self.api_url = ""
         self.api_key = ""
         self.model = ""
         self.messages = []
-        self.api_key_visible = False
         self.current_filename = None
+        self.pending_image = None  # 临时保存图片
 
-        self.build_gui()
-        self.refresh_session_list()
+        self.init_ui()
+        self.load_history()
 
-    def build_gui(self):
-        self.session_listbox = tk.Listbox(self.root, width=25, height=30)
-        self.session_listbox.grid(row=0, column=0, rowspan=6, padx=5, pady=5, sticky="ns")
-        self.session_listbox.bind("<<ListboxSelect>>", self.on_session_select)
+    def init_ui(self):
+        layout = QHBoxLayout()
 
-        tk.Label(self.root, text="API地址:").grid(row=0, column=1)
-        self.api_url_entry = tk.Entry(self.root, width=60)
-        self.api_url_entry.grid(row=0, column=2, columnspan=2)
+        self.history_list = QListWidget()
+        self.history_list.setFixedWidth(200)
+        self.history_list.itemClicked.connect(self.load_selected_session)
 
-        tk.Label(self.root, text="APIKey:").grid(row=1, column=1)
-        self.api_key_entry = tk.Entry(self.root, width=50, show="*")
-        self.api_key_entry.grid(row=1, column=2)
-        self.toggle_key_button = tk.Button(self.root, text="显示", width=8, command=self.toggle_api_key_visibility)
-        self.toggle_key_button.grid(row=1, column=3)
+        right_layout = QVBoxLayout()
 
-        tk.Label(self.root, text="模型名:").grid(row=2, column=1)
-        self.model_entry = tk.Entry(self.root, width=60)
-        self.model_entry.grid(row=2, column=2, columnspan=2)
+        self.api_url_input = QLineEdit()
+        self.api_url_input.setPlaceholderText("API 地址")
 
-        tk.Button(self.root, text="新建对话", command=self.new_session).grid(row=3, column=2)
-        tk.Button(self.root, text="保存对话", command=self.save_session).grid(row=3, column=3)
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("API Key")
+        self.api_key_input.setEchoMode(QLineEdit.Password)
 
-        self.chat_text = tk.Text(self.root, height=20, width=80, state="disabled")
-        self.chat_text.grid(row=4, column=1, columnspan=3, padx=5, pady=5)
+        self.model_input = QLineEdit()
+        self.model_input.setPlaceholderText("模型名称")
 
-        # 设置样式标签
-        self.chat_text.tag_config("user", foreground="blue", font=("Arial", 10, "bold"))
-        self.chat_text.tag_config("ai", foreground="black", font=("Arial", 10))
-        self.chat_text.tag_config("system", foreground="gray", font=("Arial", 10, "italic"))
+        self.toggle_key_btn = QPushButton("显示 Key")
+        self.toggle_key_btn.setFixedWidth(80)
+        self.toggle_key_btn.clicked.connect(self.toggle_key_visibility)
 
-        self.input_entry = tk.Entry(self.root, width=65)
-        self.input_entry.grid(row=5, column=1, columnspan=2, padx=5, pady=5)
-        self.input_entry.bind("<Return>", lambda event: self.send_message())
-        tk.Button(self.root, text="发送", command=self.send_message).grid(row=5, column=3)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.api_url_input)
+        input_row.addWidget(self.api_key_input)
+        input_row.addWidget(self.model_input)
+        input_row.addWidget(self.toggle_key_btn)
 
-    def toggle_api_key_visibility(self):
-        if self.api_key_visible:
-            self.api_key_entry.config(show="*")
-            self.toggle_key_button.config(text="显示")
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet("background-color: #f5f5f5;")
+
+        self.user_input = QLineEdit()
+        self.user_input.setPlaceholderText("请输入消息...")
+        self.user_input.returnPressed.connect(self.send_message)
+
+        self.send_btn = QPushButton("发送")
+        self.send_btn.clicked.connect(self.send_message)
+
+        self.new_btn = QPushButton("新建对话")
+        self.new_btn.clicked.connect(self.new_session)
+
+        self.save_btn = QPushButton("保存对话")
+        self.save_btn.clicked.connect(self.save_session)
+
+        self.upload_image_btn = QPushButton("上传图片")
+        self.upload_image_btn.clicked.connect(self.upload_image)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.send_btn)
+        btn_row.addWidget(self.upload_image_btn)
+        btn_row.addWidget(self.new_btn)
+        btn_row.addWidget(self.save_btn)
+
+        right_layout.addLayout(input_row)
+        right_layout.addWidget(self.chat_display)
+        right_layout.addWidget(self.user_input)
+        right_layout.addLayout(btn_row)
+
+        layout.addWidget(self.history_list)
+        layout.addLayout(right_layout)
+        self.setLayout(layout)
+
+    def load_history(self):
+        self.history_list.clear()
+        for filename in sorted(os.listdir(SESSION_DIR)):
+            if filename.endswith(".json"):
+                self.history_list.addItem(filename)
+
+    def toggle_key_visibility(self):
+        if self.api_key_input.echoMode() == QLineEdit.Password:
+            self.api_key_input.setEchoMode(QLineEdit.Normal)
+            self.toggle_key_btn.setText("隐藏 Key")
         else:
-            self.api_key_entry.config(show="")
-            self.toggle_key_button.config(text="隐藏")
-        self.api_key_visible = not self.api_key_visible
-
-    def refresh_session_list(self):
-        self.session_listbox.delete(0, tk.END)
-        files = sorted(f for f in os.listdir(SESSION_DIR) if f.endswith(".json"))
-        for f in files:
-            self.session_listbox.insert(tk.END, f)
+            self.api_key_input.setEchoMode(QLineEdit.Password)
+            self.toggle_key_btn.setText("显示 Key")
 
     def new_session(self):
-        self.api_url = self.api_url_entry.get()
-        self.api_key = self.api_key_entry.get()
-        self.model = self.model_entry.get()
-        if not self.api_url or not self.api_key or not self.model:
-            messagebox.showerror("错误", "请填写API地址、Key和模型名")
-            return
+        self.api_url = self.api_url_input.text().strip()
+        self.api_key = self.api_key_input.text().strip()
+        self.model = self.model_input.text().strip()
         self.messages = []
         self.current_filename = None
-        self.chat_text.config(state="normal")
-        self.chat_text.delete("1.0", tk.END)
-        self.chat_text.insert(tk.END, "[新对话已开始]\n", "system")
-        self.chat_text.config(state="disabled")
+        self.chat_display.clear()
+        self.append_text("[新对话已开始]\n", role="system")
 
     def send_message(self):
-        user_input = self.input_entry.get().strip()
-        if not user_input:
+        text = self.user_input.text().strip()
+        if not text and not self.pending_image:
             return
-        self.model = self.model_entry.get()  # 更新模型
-        self.input_entry.delete(0, tk.END)
-        self.messages.append({"role": "user", "content": user_input})
-        self.append_text(f"你：{user_input}\n", tag="user")
-        threading.Thread(target=self.send_message_thread).start()
 
-    def send_message_thread(self):
+        self.model = self.model_input.text().strip()
+        self.api_url = self.api_url_input.text().strip()
+        self.api_key = self.api_key_input.text().strip()
+        self.user_input.clear()
+
+        # 构造消息
+        if self.pending_image:
+            message = {
+                "role": "user",
+                "content": []
+            }
+            if text:
+                message["content"].append({"type": "text", "text": text})
+            message["content"].append({"type": "image_url", "image_url": {"url": self.pending_image}})
+            self.pending_image = None
+            self.append_text(f"你：{text} [图片已附带]\n", role="user")
+        else:
+            message = {
+                "role": "user",
+                "content": text
+            }
+            self.append_text(f"你：{text}\n", role="user")
+
+        self.messages.append(message)
+        threading.Thread(target=self.call_api, daemon=True).start()
+
+    def call_api(self):
         try:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -108,37 +182,64 @@ class ChatApp:
                 "model": self.model,
                 "messages": self.messages
             }
-            response = requests.post(self.api_url, headers=headers, json=payload)
-            data = response.json()
-
+            res = requests.post(self.api_url, headers=headers, json=payload)
+            data = res.json()
             if "choices" not in data:
-                error_msg = data.get("error", {}).get("message", "API未返回choices字段")
-                self.append_text(f"[错误] {error_msg}\n", tag="system")
+                err = data.get("error", {}).get("message", "API 返回格式错误")
+                self.append_text(f"[错误] {err}\n", role="system")
                 return
-
             reply = data["choices"][0]["message"]["content"]
             self.messages.append({"role": "assistant", "content": reply})
-            self.append_text(f"AI：{reply}\n", tag="ai")
-
+            clean = extract_clean_content(reply)
+            if clean:
+                self.append_text(f"AI：{clean}\n", role="ai")
         except Exception as e:
-            self.append_text(f"[错误] {e}\n", tag="system")
+            self.append_text(f"[异常] {e}\n", role="system")
 
-    def append_text(self, text, tag=""):
-        self.chat_text.config(state="normal")
-        if tag:
-            self.chat_text.insert(tk.END, text, tag)
-        else:
-            self.chat_text.insert(tk.END, text)
-        self.chat_text.see(tk.END)
-        self.chat_text.config(state="disabled")
+    def upload_image(self):
+        model_name = self.model_input.text().strip()
+        if "image" not in SUPPORTED_MODELS.get(model_name, []):
+            QMessageBox.warning(self, "不支持", "当前模型不支持图片输入。")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg)")
+        if not file_path:
+            return
+
+        with open(file_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        image_url = f"data:image/jpeg;base64,{encoded}"
+        self.pending_image = image_url
+
+        self.append_text(f"你：已上传图片 {os.path.basename(file_path)}（将在下次发送时一并发送）\n", role="user")
+
+    def append_text(self, text, role="ai"):
+        fmt = QTextCharFormat()
+        if role == "user":
+            fmt.setForeground(QColor("blue"))
+            fmt.setFontWeight(QFont.Bold)
+        elif role == "ai":
+            fmt.setForeground(QColor("black"))
+        elif role == "system":
+            fmt.setForeground(QColor("gray"))
+            fmt.setFontItalic(True)
+
+        self.chat_display.moveCursor(QTextCursor.End)
+        self.chat_display.setCurrentCharFormat(fmt)
+        self.chat_display.insertPlainText(text)
+        self.chat_display.moveCursor(QTextCursor.End)
 
     def save_session(self):
         if not self.current_filename:
-            filename = simpledialog.askstring("保存对话", "请输入会话名称：")
-            if not filename:
+            name, _ = QFileDialog.getSaveFileName(self, "保存对话", SESSION_DIR, "*.json")
+            if not name:
                 return
+            if not name.endswith(".json"):
+                name += ".json"
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.current_filename = f"{filename}_{timestamp}.json"
+            base = os.path.splitext(os.path.basename(name))[0]
+            self.current_filename = f"{base}_{timestamp}.json"
 
         filepath = os.path.join(SESSION_DIR, self.current_filename)
         with open(filepath, "w", encoding="utf-8") as f:
@@ -148,59 +249,43 @@ class ChatApp:
                 "model": self.model,
                 "messages": self.messages
             }, f, indent=2)
-        messagebox.showinfo("成功", f"已保存到 {filepath}")
-        self.refresh_session_list()
-
-        # 清空对话和输入框内容
+        QMessageBox.information(self, "保存成功", f"对话保存至: {filepath}")
+        self.load_history()
+        self.chat_display.clear()
+        self.api_url_input.clear()
+        self.api_key_input.clear()
+        self.model_input.clear()
         self.messages = []
-        self.chat_text.config(state="normal")
-        self.chat_text.delete("1.0", tk.END)
-        self.chat_text.insert(tk.END, "[新对话已开始]\n", "system")
-        self.chat_text.config(state="disabled")
-        self.input_entry.delete(0, tk.END)
-
-        # 清除API地址、Key、模型框内容
-        self.api_url_entry.delete(0, tk.END)
-        self.api_key_entry.delete(0, tk.END)
-        self.model_entry.delete(0, tk.END)
-
-        self.api_url = ""
-        self.api_key = ""
-        self.model = ""
         self.current_filename = None
+        self.append_text("[新对话已开始]\n", role="system")
 
-    def on_session_select(self, event):
-        if not self.session_listbox.curselection():
-            return
-        index = self.session_listbox.curselection()[0]
-        filename = self.session_listbox.get(index)
-        filepath = os.path.join(SESSION_DIR, filename)
-        with open(filepath, "r", encoding="utf-8") as f:
+    def load_selected_session(self, item):
+        filename = item.text()
+        path = os.path.join(SESSION_DIR, filename)
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        self.api_url = data["api_url"]
-        self.api_key = data["api_key"]
-        self.model = data["model"]
-        self.messages = data["messages"]
+        self.api_url = data.get("api_url", "")
+        self.api_key = data.get("api_key", "")
+        self.model = data.get("model", "")
+        self.messages = data.get("messages", [])
         self.current_filename = filename
 
-        self.api_url_entry.delete(0, tk.END)
-        self.api_url_entry.insert(0, self.api_url)
-        self.api_key_entry.delete(0, tk.END)
-        self.api_key_entry.insert(0, self.api_key)
-        self.model_entry.delete(0, tk.END)
-        self.model_entry.insert(0, self.model)
+        self.api_url_input.setText(self.api_url)
+        self.api_key_input.setText(self.api_key)
+        self.model_input.setText(self.model)
 
-        self.chat_text.config(state="normal")
-        self.chat_text.delete("1.0", tk.END)
-        self.chat_text.insert(tk.END, f"[已载入对话：{filename}]\n", "system")
+        self.chat_display.clear()
+        self.append_text(f"[已加载对话：{filename}]\n", role="system")
         for msg in self.messages:
-            role = "你" if msg["role"] == "user" else "AI"
-            tag = "user" if msg["role"] == "user" else "ai"
-            self.chat_text.insert(tk.END, f"{role}：{msg['content']}\n", tag)
-        self.chat_text.config(state="disabled")
+            raw = msg.get("content", "")
+            content = extract_clean_content(raw)
+            if not content:
+                continue
+            who = "你" if msg["role"] == "user" else "AI"
+            self.append_text(f"{who}：{content}\n", role=msg["role"])
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ChatApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    win = ChatWindow()
+    win.show()
+    sys.exit(app.exec())
